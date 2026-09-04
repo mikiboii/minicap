@@ -1,0 +1,510 @@
+Great — we can already determine **a lot** from `libsf_r31.so`, and this one is much more revealing than the filename suggests.
+
+## What `libsf_r31.so` actually is
+
+This is a **native Android SurfaceFlinger screen-capture helper library**.
+
+The strongest evidence is that it directly imports Android's:
+
+```text
+android::ScreenshotClient
+android::SurfaceComposerClient
+android::GraphicBuffer
+android::gui::IScreenCaptureListener
+android::Fence
+```
+
+and exports functions named:
+
+```text
+surf_info
+surf_info2
+surf_screenshot_rect2
+surf_screenshot_rect_fix
+surf_update2_a28
+surf_update_rect2_a28
+surf_update_req2_a28
+dpy_info
+rotate
+adjust_orientation
+partial_copy
+```
+
+So this is **not an encoder**. Its primary job is interacting with Android's display/surface system and obtaining screen pixels.
+
+---
+
+# 1. What `r31` means
+
+The ELF identifies itself as:
+
+```text
+ELF 32-bit LSB ARM
+Android 31
+```
+
+and its SONAME is:
+
+```text
+libsf_r31.so
+```
+
+It was also built with:
+
+```text
+Surfaceflinger build version ...
+Dec  9 2021
+r3761
+```
+
+So this is an **ARM 32-bit Android 12 / API 31-oriented SurfaceFlinger library**.
+
+That's already interesting because your collection contains:
+
+```text
+libsf_r16.so
+libsf_r17.so
+libsf_r18.so
+...
+libsf_r31.so
+```
+
+This is almost certainly a collection of compatibility implementations for different Android releases/API levels.
+
+---
+
+# 2. The most important discovery: it uses ScreenshotClient
+
+The library imports:
+
+```text
+android::ScreenshotClient::captureDisplay(...)
+```
+
+twice.
+
+In particular:
+
+```text
+_ZN7android16ScreenshotClient14captureDisplay...
+```
+
+This is Android's native screenshot/display capture mechanism.
+
+It also imports:
+
+```text
+android::SurfaceComposerClient::getInternalDisplayToken()
+android::SurfaceComposerClient::getInternalDisplayId()
+android::SurfaceComposerClient::getPhysicalDisplayToken()
+android::SurfaceComposerClient::getDisplayState()
+```
+
+So the basic operation is approximately:
+
+```text
+             Android
+                │
+                ▼
+        SurfaceFlinger
+                │
+        SurfaceComposer
+                │
+                ▼
+       ScreenshotClient
+                │
+                ▼
+          GraphicBuffer
+                │
+                ▼
+           libsf_r31.so
+```
+
+That is a **very important distinction from minicap**.
+
+---
+
+# 3. It obtains GraphicBuffer data
+
+It imports:
+
+```text
+android::GraphicBuffer::lock(...)
+android::bytesPerPixel(...)
+```
+
+That means the library doesn't merely ask Android:
+
+> "Take a screenshot."
+
+It also obtains/accesses the resulting graphics buffer.
+
+The likely flow is:
+
+```text
+ScreenshotClient.captureDisplay()
+             │
+             ▼
+       GraphicBuffer
+             │
+             ▼
+      GraphicBuffer.lock()
+             │
+             ▼
+        CPU-readable
+        pixel memory
+```
+
+That is probably where the actual screenshot bytes become available to the library.
+
+---
+
+# 4. It has explicit screenshot functions
+
+These exports are particularly interesting:
+
+```text
+surf_screenshot_rect2
+surf_screenshot_rect_fix
+```
+
+The name strongly suggests:
+
+```text
+surf_screenshot_rect2(...)
+surf_screenshot_rect_fix(...)
+```
+
+capture a **rectangle of the display**, rather than necessarily copying the entire display.
+
+There's also:
+
+```text
+ScreenshotClient_capture(...)
+```
+
+which is an exported wrapper around Android's ScreenshotClient functionality.
+
+So we can already infer that the library provides a native API roughly like:
+
+```text
+capture display
+      ↓
+select rectangle
+      ↓
+obtain GraphicBuffer
+      ↓
+copy pixels
+```
+
+---
+
+# 5. `partial_copy` is especially interesting for your latency investigation
+
+It exports:
+
+```text
+partial_copy
+partial_copy_ori
+```
+
+This is a big clue.
+
+It suggests the library supports copying only part of a screenshot:
+
+```text
+┌──────────────────────────────┐
+│                              │
+│     ┌──────────────┐         │
+│     │ changed area │         │
+│     └──────────────┘         │
+│                              │
+└──────────────────────────────┘
+```
+
+rather than always copying:
+
+```text
+┌──────────────────────────────┐
+│                              │
+│        ENTIRE FRAME          │
+│                              │
+│                              │
+└──────────────────────────────┘
+```
+
+That could be **extremely relevant** to what you were discovering with minicap.
+
+You previously noticed that if nothing changes on the Android screen, the capture mechanism may report nothing new.
+
+This library has explicit functionality that looks related to **partial/region copying**.
+
+We shouldn't conclude yet that it does dirty-region detection — but it's definitely something we should investigate.
+
+---
+
+# 6. Orientation handling
+
+It exports:
+
+```text
+rotate
+adjust_orientation
+```
+
+So the library handles display orientation itself.
+
+Likely something like:
+
+```text
+Android screen
+      │
+      ▼
+capture buffer
+      │
+      ▼
+orientation?
+      │
+ ┌────┴────┐
+ │         │
+0°       90/180/270°
+ │         │
+ └────┬────┘
+      ▼
+   rotate()
+      │
+      ▼
+corrected frame
+```
+
+This matters because screen capture dimensions can change when Android rotates.
+
+---
+
+# 7. `surf_info` / `surf_info2`
+
+These are likely information/query functions.
+
+We have:
+
+```text
+surf_info
+surf_info2
+dpy_info
+surf_version
+surf_errno
+```
+
+So the library appears to expose a little API around the Android SurfaceFlinger interface:
+
+```text
+surf_version()
+surf_errno()
+
+dpy_info()
+surf_info()
+surf_info2()
+
+surf_screenshot_rect2()
+surf_screenshot_rect_fix()
+
+surf_update2_a28()
+surf_update_rect2_a28()
+surf_update_req2_a28()
+```
+
+This looks much more like a **purpose-built screen capture library** than a general-purpose Android library.
+
+---
+
+# 8. `AndroidBitmap_compress` is another important clue
+
+It imports:
+
+```text
+AndroidBitmap_compress
+```
+
+That's from:
+
+```text
+libjnigraphics.so
+```
+
+So the library can potentially compress the captured pixels into an Android bitmap format.
+
+The presence of:
+
+```text
+AndroidBitmap_compress
+```
+
+means we should investigate whether one of its APIs can produce something like:
+
+```text
+GraphicBuffer
+     ↓
+pixels
+     ↓
+AndroidBitmap
+     ↓
+compressed output
+```
+
+However, **this does not mean the library produces H.264**.
+
+There are no obvious H.264/HEVC encoder dependencies here.
+
+---
+
+# 9. It does NOT appear to be the H.264 encoder
+
+This is important for your project.
+
+`libsf_r31.so` does **not** import obvious codec/encoder libraries.
+
+Instead it imports:
+
+```text
+libgui.so
+libui.so
+libhwui.so
+libbinder.so
+libjnigraphics.so
+```
+
+That's exactly the ecosystem we'd expect for:
+
+**display → SurfaceFlinger → GraphicBuffer → pixels**
+
+Whereas your:
+
+```text
+libhwenc_r31.so
+libhwencv2_r31.so
+```
+
+are the ones I'd expect to investigate for:
+
+**pixels → H.264/H.265**
+
+So our emerging architecture is:
+
+```text
+             ANDROID
+                │
+                ▼
+         SurfaceFlinger
+                │
+                ▼
+        ┌───────────────┐
+        │ libsf_r31.so  │
+        │               │
+        │ screen capture│
+        │ GraphicBuffer │
+        │ crop/rotate   │
+        │ pixel copying │
+        └───────┬───────┘
+                │
+                │ raw pixels
+                ▼
+        ┌─────────────────┐
+        │ libhwenc_r31.so │
+        │                 │
+        │ H.264 encoder?  │
+        └────────┬────────┘
+                 │
+                 ▼
+              H.264
+```
+
+**This is exactly the relationship I want to investigate next.**
+
+---
+
+# 10. There's something particularly interesting about the API-level compatibility
+
+Notice these functions:
+
+```text
+surf_update2_a28
+surf_update_rect2_a28
+surf_update_req2_a28
+surf_update_rect2_a28_fix
+```
+
+The `_a28` suffix almost certainly indicates an Android API/version-specific implementation.
+
+So this library appears to have accumulated workarounds for different Android SurfaceFlinger APIs.
+
+That's consistent with your directory containing:
+
+```text
+libsf_r16.so
+libsf_r17.so
+...
+libsf_r31.so
+```
+
+The project is probably selecting the appropriate implementation depending on the Android version.
+
+---
+
+# 11. Current functionality map
+
+Based on the actual binary, I'd currently classify `libsf_r31.so` like this:
+
+| Functionality              | Evidence                           | Confidence    |
+| -------------------------- | ---------------------------------- | ------------- |
+| SurfaceFlinger interaction | `SurfaceComposerClient`            | **Very high** |
+| Display identification     | `getInternalDisplayId`, tokens     | **Very high** |
+| Screen capture             | `ScreenshotClient::captureDisplay` | **Very high** |
+| GraphicBuffer access       | `GraphicBuffer::lock`              | **Very high** |
+| Pixel copying              | `partial_copy`                     | **Very high** |
+| Rectangle capture/copy     | `surf_screenshot_rect*`            | **High**      |
+| Rotation                   | `rotate`, `adjust_orientation`     | **High**      |
+| Display information        | `dpy_info`                         | **High**      |
+| Surface information        | `surf_info`, `surf_info2`          | **High**      |
+| Bitmap compression         | `AndroidBitmap_compress`           | **High**      |
+| H.264 encoding             | No evidence                        | **Low**       |
+| Network/ADB transport      | No evidence                        | **Very low**  |
+
+---
+
+## The next thing I want to determine
+
+We have identified **what category of library this is**.
+
+Now we should go one level deeper and determine **the exact API and data flow**.
+
+The most valuable functions to reverse-engineer are:
+
+```text
+surf_info2
+surf_screenshot_rect2
+surf_screenshot_rect_fix
+surf_update2_a28
+surf_update_rect2_a28
+partial_copy
+ScreenshotClient_capture
+```
+
+Especially `surf_screenshot_rect2`.
+
+If we can reconstruct its arguments, we may discover something like:
+
+```c
+int surf_screenshot_rect2(
+    int x,
+    int y,
+    int width,
+    int height,
+    ...
+);
+```
+
+and determine **exactly where the captured pixels are written, what pixel format they use, and whether the capture is full-frame or incremental**.
+
+That is the part that can directly answer your original goal of finding **all the functionality** of this `.so`.
+
+If you want to continue one step at a time, **`surf_screenshot_rect2` should be our next target**.

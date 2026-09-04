@@ -17,6 +17,8 @@ adb push "C:\Users\miki\Downloads\Programs\cpp\minicap\jni\minicap-shared\aosp\l
 
 adb push "C:\Users\miki\Downloads\Programs\cpp\minicap\libs\arm64-v8a\minicap" "$dir/"
 
+adb push "C:\Users\miki\Downloads\Programs\cpp\minicap\info\SF_so\libsf_r31.so" "$dir/"
+
 
 adb forward tcp:8080 tcp:8080
 
