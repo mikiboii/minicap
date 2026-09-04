@@ -2,15 +2,16 @@
     "configurations": [
         {
             "name": "Android-NDK",
-            "compilerPath": "I:/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/bin/clang++.exe",
+            "compilerPath": "W:/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/bin/clang++.exe",
             "intelliSenseMode": "clang-x64",
             "cStandard": "c17",
             "cppStandard": "c++20",
             "includePath": [
                 "${workspaceFolder}/**",
-                "I:/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include",
-                "I:/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/c++/v1",
-                "I:/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/x86_64-linux-android"
+                "W:/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include",
+                "W:/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/c++/v1",
+                "W:/android-ndk-r27d/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/x86_64-linux-android",
+                "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.44.35207/include"
             ],
             "defines": [
                 "__ANDROID__",

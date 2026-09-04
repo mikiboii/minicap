@@ -16,7 +16,7 @@
 #include <media/NdkMediaFormat.h>
 
 // Tunables
-static const int TARGET_FPS = 30;
+static const int TARGET_FPS = 60;
 static const int MAX_SIZE = 1080;
 static const int CAPTURE_DURATION_SECONDS = 5;
 static const int INPUT_DEQUEUE_TIMEOUT_US = 5000;
