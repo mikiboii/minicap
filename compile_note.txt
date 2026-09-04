@@ -1,0 +1,13 @@
+I:\android-ndk-r27d\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android21-clang++.cmd -o hello hello.cpp
+
+
+
+
+
+adb push hello /data/local/tmp/
+adb shell chmod +x /data/local/tmp/hello
+adb shell /data/local/tmp/hello
+
+
+
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass

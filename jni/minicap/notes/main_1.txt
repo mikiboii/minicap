@@ -1,0 +1,197 @@
+#include <iostream>
+#include <vector>
+#include <chrono>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <unistd.h>
+#include <cstring>
+
+#include <Minicap.hpp>
+#include <media/NdkMediaCodec.h>
+#include <media/NdkMediaFormat.h>
+
+static const int CAPTURE_DURATION_MS = 3000;
+static const int TARGET_FPS = 60;
+static const int FRAME_PERIOD_MS = 1000 / TARGET_FPS;
+static const int MAX_SIZE = 1080;
+
+// Frame waiter
+class FrameWaiter : public Minicap::FrameAvailableListener {
+public:
+    FrameWaiter() : mPendingFrames(0), mStopped(false) {}
+    void onFrameAvailable() override {
+        std::unique_lock<std::mutex> lock(mMutex);
+        ++mPendingFrames;
+        mCond.notify_one();
+    }
+    bool waitForFrame(int timeout_ms = 200) {
+        std::unique_lock<std::mutex> lock(mMutex);
+        if (mStopped) return false;
+        if (mPendingFrames > 0) { --mPendingFrames; return true; }
+        if (!mCond.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+            [this]{ return mPendingFrames > 0 || mStopped; }))
+            return false;
+        if (mStopped) return false;
+        --mPendingFrames;
+        return true;
+    }
+    void stop() {
+        std::unique_lock<std::mutex> lock(mMutex);
+        mStopped = true;
+        mCond.notify_all();
+    }
+private:
+    std::mutex mMutex;
+    std::condition_variable mCond;
+    int mPendingFrames;
+    bool mStopped;
+};
+
+static FrameWaiter gWaiter;
+
+static void signal_handler(int signum) {
+    gWaiter.stop();
+}
+
+// Create MediaCodec encoder
+AMediaCodec* createH264Encoder(int width, int height, int bitrate, int fps) {
+    AMediaCodec* codec = AMediaCodec_createEncoderByType("video/avc");
+    if (!codec) return nullptr;
+
+    AMediaFormat* format = AMediaFormat_new();
+    AMediaFormat_setString(format, "mime", "video/avc");
+    AMediaFormat_setInt32(format, "width", width);
+    AMediaFormat_setInt32(format, "height", height);
+    AMediaFormat_setInt32(format, "bitrate", bitrate);
+    AMediaFormat_setInt32(format, "frame-rate", fps);
+    AMediaFormat_setInt32(format, "i-frame-interval", 1); // 1 sec
+    AMediaFormat_setInt32(format, "color-format", 21); // COLOR_FormatYUV420Flexible
+
+    if (AMediaCodec_configure(codec, format, nullptr, nullptr, AMEDIACODEC_CONFIGURE_FLAG_ENCODE) != AMEDIA_OK) {
+        AMediaFormat_delete(format);
+        return nullptr;
+    }
+    AMediaFormat_delete(format);
+    if (AMediaCodec_start(codec) != AMEDIA_OK) return nullptr;
+    return codec;
+}
+
+int main(int argc, char** argv) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    const int displayId = 0;
+    minicap_start_thread_pool();
+
+    Minicap* minicap = minicap_create(displayId);
+    if (!minicap) { std::cerr << "Failed to create Minicap\n"; return 1; }
+
+    Minicap::DisplayInfo realInfo;
+    if (minicap_try_get_display_info(displayId, &realInfo) != 0) {
+        std::cerr << "minicap_try_get_display_info failed\n";
+        minicap_free(minicap);
+        return 1;
+    }
+
+    // SCRCPY-style max size
+    Minicap::DisplayInfo desiredInfo = realInfo;
+    int w = realInfo.width;
+    int h = realInfo.height;
+    int longSide = (w > h) ? w : h;
+    if (longSide > MAX_SIZE) {
+        float scale = (float)MAX_SIZE / longSide;
+        desiredInfo.width = (int)((w * scale) / 2) * 2;
+        desiredInfo.height = (int)((h * scale) / 2) * 2;
+    }
+
+    std::cout << "Real: " << w << "x" << h << " | Chosen: "
+              << desiredInfo.width << "x" << desiredInfo.height << "\n";
+
+    if (minicap->setRealInfo(realInfo) != 0 || minicap->setDesiredInfo(desiredInfo) != 0) {
+        std::cerr << "Failed to set info\n";
+        minicap_free(minicap);
+        return 1;
+    }
+
+    minicap->setFrameAvailableListener(&gWaiter);
+    if (minicap->applyConfigChanges() != 0) {
+        std::cerr << "applyConfigChanges failed\n";
+        minicap_free(minicap);
+        return 1;
+    }
+
+    // H.264 encoder
+    int bitrate = 4000000; // 4 Mbps
+    AMediaCodec* encoder = createH264Encoder(desiredInfo.width, desiredInfo.height, bitrate, TARGET_FPS);
+    if (!encoder) { std::cerr << "Failed to create encoder\n"; return 1; }
+
+    std::vector<double> frameTimes;
+    Minicap::Frame frame;
+    auto start = std::chrono::steady_clock::now();
+
+    while (true) {
+        auto loopStart = std::chrono::steady_clock::now();
+
+        if (!gWaiter.waitForFrame(200)) {
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count() >= CAPTURE_DURATION_MS)
+                break;
+            continue;
+        }
+
+        if (minicap->consumePendingFrame(&frame) == 0) {
+            // Encode frame
+            auto encodeStart = std::chrono::steady_clock::now();
+
+            // Feed raw frame to encoder
+            int inputIndex = AMediaCodec_dequeueInputBuffer(encoder, 0);
+            if (inputIndex >= 0) {
+                size_t bufSize;
+                uint8_t* buf = AMediaCodec_getInputBuffer(encoder, inputIndex, &bufSize);
+                if (buf) {
+                    memcpy(buf, frame.data, std::min(bufSize, (size_t)frame.size));
+                    AMediaCodec_queueInputBuffer(encoder, inputIndex, 0, frame.size, 0, 0);
+                }
+            }
+
+            // Get output
+            AMediaCodecBufferInfo info;
+            ssize_t outIndex = AMediaCodec_dequeueOutputBuffer(encoder, &info, 0);
+            while (outIndex >= 0) {
+                // You could write info.size bytes from encoder output to file/network here
+                AMediaCodec_releaseOutputBuffer(encoder, outIndex, false);
+                outIndex = AMediaCodec_dequeueOutputBuffer(encoder, &info, 0);
+            }
+
+            auto encodeEnd = std::chrono::steady_clock::now();
+            double ms = std::chrono::duration<double, std::milli>(encodeEnd - loopStart).count();
+            frameTimes.push_back(ms);
+
+            minicap->releaseConsumedFrame(&frame);
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count() >= CAPTURE_DURATION_MS)
+            break;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(FRAME_PERIOD_MS / 2));
+    }
+
+    double sum = 0.0;
+    for (double t : frameTimes) sum += t;
+    std::cout << "Captured+Encoded frames: " << frameTimes.size() << "\n";
+    if (!frameTimes.empty())
+        std::cout << "Average capture+encode time (ms): " << (sum / frameTimes.size()) << "\n";
+
+    minicap_free(minicap);
+    gWaiter.stop();
+    AMediaCodec_stop(encoder);
+    AMediaCodec_delete(encoder);
+
+    return 0;
+}

@@ -1,0 +1,84 @@
+import socket
+import struct
+import av
+import cv2
+import numpy as np
+
+HOST = '127.0.0.1'
+PORT = 8080
+
+def recv_exact(sock, size):
+    """Receive exactly `size` bytes or raise error."""
+    buf = b''
+    while len(buf) < size:
+        chunk = sock.recv(size - len(buf))
+        if not chunk:
+            raise RuntimeError("Socket closed while receiving data")
+        buf += chunk
+    return buf
+
+# Connect to server
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect((HOST, PORT))
+print("Connected to server")
+
+# Create H.264 decoder
+codec = av.CodecContext.create('h264', 'r')
+print("H.264 decoder created")
+
+frame_id = 0
+
+try:
+    while True:
+
+        # Read 4-byte big-endian frame length
+        try:
+            raw_len = recv_exact(s, 4)
+        except Exception as e:
+            print("Failed to read frame length:", e)
+            break
+
+        frame_len = struct.unpack(">I", raw_len)[0]
+        # print(f"\n--- Frame #{frame_id+1} ---")
+        # print(f"Frame length: {frame_len} bytes")
+
+        # Read H.264 data
+        try:
+            data = recv_exact(s, frame_len)
+        except Exception as e:
+            print("Failed to read frame data:", e)
+            break
+
+        frame_id += 1
+        # print(f"Received complete frame #{frame_id}. Decoding...")
+
+        # Decode
+        try:
+            frames = codec.decode(av.Packet(data))
+        except Exception as e:
+            print(f"Decoding error on frame #{frame_id}: {e}")
+            continue
+
+        if not frames:
+            print(f"No decoded frame from packet #{frame_id}")
+            continue
+
+        # Display frames
+        for f in frames:
+            img = f.to_ndarray(format='bgr24')
+
+            # img_nv21 = cv2.cvtColor(np.frombuffer(frame, dtype=np.uint8).reshape((H + H//2, W)), cv2.COLOR_YUV2BGR_NV21)
+
+            # Try NV12
+            # img = cv2.cvtColor(np.frombuffer(f, dtype=np.uint8).reshape((H + H//2, W)), cv2.COLOR_YUV2BGR_NV12)
+
+            cv2.imshow("Android Screen", img)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            print("Exit requested by user.")
+            break
+
+finally:
+    print("Closing socket...")
+    s.close()
+    cv2.destroyAllWindows()

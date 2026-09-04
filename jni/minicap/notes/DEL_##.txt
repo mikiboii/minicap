@@ -1,0 +1,805 @@
+// #include <iostream>
+// #include <vector>
+// #include <chrono>
+// #include <thread>
+// #include <mutex>
+// #include <condition_variable>
+// #include <unistd.h>
+
+// #include <Minicap.hpp>
+
+// // Duration & FPS
+// static const int CAPTURE_DURATION_MS = 3000; // 3 seconds
+// static const int TARGET_FPS = 60;
+// static const int FRAME_PERIOD_MS = 1000 / TARGET_FPS;
+
+// // Hard-coded scrcpy-style max size:
+// static const int MAX_SIZE = 1080;
+
+// class FrameWaiter : public Minicap::FrameAvailableListener {
+// public:
+//   FrameWaiter() : mPendingFrames(0), mStopped(false) {}
+
+//   void onFrameAvailable() override {
+//     std::unique_lock<std::mutex> lock(mMutex);
+//     ++mPendingFrames;
+//     mCond.notify_one();
+//   }
+
+//   bool waitForFrame(int timeout_ms = 200) {
+//     std::unique_lock<std::mutex> lock(mMutex);
+//     if (mStopped) return false;
+
+//     if (mPendingFrames > 0) {
+//       --mPendingFrames;
+//       return true;
+//     }
+
+//     if (!mCond.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+//         [this]{ return mPendingFrames > 0 || mStopped; }))
+//       return false;
+
+//     if (mStopped) return false;
+
+//     --mPendingFrames;
+//     return true;
+//   }
+
+//   void stop() {
+//     std::unique_lock<std::mutex> lock(mMutex);
+//     mStopped = true;
+//     mCond.notify_all();
+//   }
+
+// private:
+//   std::mutex mMutex;
+//   std::condition_variable mCond;
+//   int mPendingFrames;
+//   bool mStopped;
+// };
+
+// static FrameWaiter gWaiter;
+
+// static void signal_handler(int signum) {
+//   gWaiter.stop();
+// }
+
+// int main(int argc, char** argv) {
+//   // Install signal handler
+//   struct sigaction sa;
+//   memset(&sa, 0, sizeof(sa));
+//   sa.sa_handler = signal_handler;
+//   sigemptyset(&sa.sa_mask);
+//   sigaction(SIGINT, &sa, NULL);
+//   sigaction(SIGTERM, &sa, NULL);
+
+//   const int displayId = 0;
+
+//   // Start binder thread pool (required by minicap)
+//   minicap_start_thread_pool();
+
+//   // Create minicap instance
+//   Minicap* minicap = minicap_create(displayId);
+//   if (!minicap) {
+//     std::cerr << "Failed to create Minicap instance\n";
+//     return 1;
+//   }
+
+//   // Get real display info
+//   Minicap::DisplayInfo realInfo;
+//   if (minicap_try_get_display_info(displayId, &realInfo) != 0) {
+//     std::cerr << "minicap_try_get_display_info failed\n";
+//     minicap_free(minicap);
+//     return 1;
+//   }
+
+//   // === SCRCPY-STYLE MAX-SIZE LOGIC ===
+
+//   // Copy original as base
+//   Minicap::DisplayInfo desiredInfo = realInfo;
+
+//   int w = realInfo.width;
+//   int h = realInfo.height;
+
+//   // Determine longer side
+//   int longSide = (w > h) ? w : h;
+
+//   if (longSide > MAX_SIZE) {
+//     // scaling factor < 1
+//     float scale = (float)MAX_SIZE / (float)longSide;
+
+//     int newW = (int)(w * scale);
+//     int newH = (int)(h * scale);
+
+//     // Ensure even numbers (required by many consumers)
+//     newW = (newW / 2) * 2;
+//     newH = (newH / 2) * 2;
+
+//     // Never reduce below 2
+//     if (newW < 2) newW = 2;
+//     if (newH < 2) newH = 2;
+
+//     desiredInfo.width = newW;
+//     desiredInfo.height = newH;
+//   }
+
+//   // Print chosen resolution (debug)
+//   std::cout << "Real size: " << w << "x" << h << "\n";
+//   std::cout << "Chosen size: " << desiredInfo.width << "x" << desiredInfo.height << "\n";
+
+//   // Set up minicap with real+desired info
+//   if (minicap->setRealInfo(realInfo) != 0) {
+//     std::cerr << "minicap->setRealInfo failed\n";
+//     minicap_free(minicap);
+//     return 1;
+//   }
+//   if (minicap->setDesiredInfo(desiredInfo) != 0) {
+//     std::cerr << "minicap->setDesiredInfo failed\n";
+//     minicap_free(minicap);
+//     return 1;
+//   }
+
+//   // Install frame listener
+//   minicap->setFrameAvailableListener(&gWaiter);
+
+//   // Apply config — creates virtual display internally
+//   if (minicap->applyConfigChanges() != 0) {
+//     std::cerr << "minicap->applyConfigChanges failed\n";
+//     minicap_free(minicap);
+//     return 1;
+//   }
+
+//   // Capture loop
+//   std::vector<double> frameTimes;
+//   Minicap::Frame frame;
+//   auto captureStart = std::chrono::steady_clock::now();
+
+//   while (true) {
+//     auto loopStart = std::chrono::steady_clock::now();
+
+//     if (!gWaiter.waitForFrame(200)) {
+//       auto now = std::chrono::steady_clock::now();
+//       if (std::chrono::duration_cast<std::chrono::milliseconds>(now - captureStart).count() >= CAPTURE_DURATION_MS)
+//         break;
+//       continue;
+//     }
+
+//     if (minicap->consumePendingFrame(&frame) == 0) {
+//       minicap->releaseConsumedFrame(&frame);
+//     }
+
+//     auto loopEnd = std::chrono::steady_clock::now();
+//     double ms = std::chrono::duration<double, std::milli>(loopEnd - loopStart).count();
+//     frameTimes.push_back(ms);
+
+//     auto now = std::chrono::steady_clock::now();
+//     if (std::chrono::duration_cast<std::chrono::milliseconds>(now - captureStart).count() >= CAPTURE_DURATION_MS)
+//       break;
+
+//     std::this_thread::sleep_for(std::chrono::milliseconds(FRAME_PERIOD_MS / 2));
+//   }
+
+//   // Print stats
+//   double sum = 0.0;
+//   for (double t : frameTimes) sum += t;
+
+//   std::cout << "Captured frames: " << frameTimes.size() << "\n";
+//   if (!frameTimes.empty())
+//     std::cout << "Average loop time (ms): " << (sum / frameTimes.size()) << "\n";
+//   else
+//     std::cout << "No frames captured\n";
+
+//   // Cleanup
+//   minicap_free(minicap);
+//   gWaiter.stop();
+
+//   return 0;
+// }
+
+
+
+
+
+
+// minicap_test_opengl_conversion_fixed.cpp
+#include <iostream>
+#include <vector>
+#include <chrono>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <unistd.h>
+#include <cstring>
+#include <algorithm>
+
+#include <Minicap.hpp>
+
+// Add OpenGL ES includes
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES3/gl3.h>
+#include <GLES2/gl2ext.h>
+
+// Duration
+static const int CAPTURE_DURATION_MS = 3000;
+static const int MAX_SIZE = 1080;
+
+// Frame waiter (same as before)
+class FrameWaiter : public Minicap::FrameAvailableListener {
+public:
+    FrameWaiter() : mPendingFrames(0), mStopped(false) {}
+    
+    void onFrameAvailable() override {
+        std::unique_lock<std::mutex> lock(mMutex);
+        ++mPendingFrames;
+        mCond.notify_one();
+    }
+    
+    bool waitForFrame(int timeout_ms = 100) {
+        std::unique_lock<std::mutex> lock(mMutex);
+        if (mStopped) return false;
+        if (mPendingFrames > 0) { --mPendingFrames; return true; }
+        return mCond.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+            [this]{ return mPendingFrames > 0 || mStopped; }) && !mStopped;
+    }
+    
+    void stop() {
+        std::unique_lock<std::mutex> lock(mMutex);
+        mStopped = true;
+        mCond.notify_all();
+    }
+    
+private:
+    std::mutex mMutex;
+    std::condition_variable mCond;
+    int mPendingFrames;
+    bool mStopped;
+};
+
+static FrameWaiter gWaiter;
+
+static void signal_handler(int signum) {
+    gWaiter.stop();
+}
+
+// Simple CPU conversion for comparison
+void rgbToNV12_cpu(const uint8_t* src, uint8_t* dst,
+                   int width, int height,
+                   int srcStrideBytes, int bpp,
+                   Minicap::Format fmt) {
+    uint8_t* yPlane = dst;
+    uint8_t* uvPlane = dst + width * height;
+    
+    int rIdx = 0, gIdx = 1, bIdx = 2;
+    if (fmt == Minicap::FORMAT_BGRA_8888) { bIdx = 0; gIdx = 1; rIdx = 2; }
+    else if (fmt == Minicap::FORMAT_RGBA_8888) { rIdx = 0; gIdx = 1; bIdx = 2; }
+    
+    // Y plane
+    for (int y = 0; y < height; y++) {
+        const uint8_t* srcRow = src + (size_t)y * srcStrideBytes;
+        uint8_t* yRow = yPlane + (size_t)y * width;
+        for (int x = 0; x < width; x++) {
+            const uint8_t* px = srcRow + x * bpp;
+            int R = px[rIdx], G = px[gIdx], B = px[bIdx];
+            int Y = ((66 * R + 129 * G + 25 * B + 128) >> 8) + 16;
+            yRow[x] = (uint8_t)(Y < 0 ? 0 : (Y > 255 ? 255 : Y));
+        }
+    }
+    
+    // UV plane
+    for (int y = 0; y < height; y += 2) {
+        const uint8_t* srcRow0 = src + (size_t)y * srcStrideBytes;
+        const uint8_t* srcRow1 = src + (size_t)(y + 1) * srcStrideBytes;
+        uint8_t* uvRow = uvPlane + (size_t)(y / 2) * width;
+        for (int x = 0; x < width; x += 2) {
+            const uint8_t* px00 = srcRow0 + x * bpp;
+            const uint8_t* px01 = srcRow0 + (x + 1) * bpp;
+            const uint8_t* px10 = srcRow1 + x * bpp;
+            const uint8_t* px11 = srcRow1 + (x + 1) * bpp;
+            
+            int R = (px00[rIdx] + px01[rIdx] + px10[rIdx] + px11[rIdx]) / 4;
+            int G = (px00[gIdx] + px01[gIdx] + px10[gIdx] + px11[gIdx]) / 4;
+            int B = (px00[bIdx] + px01[bIdx] + px10[bIdx] + px11[bIdx]) / 4;
+            
+            int U = ((-38 * R - 74 * G + 112 * B + 128) >> 8) + 128;
+            int V = ((112 * R - 94 * G - 18 * B + 128) >> 8) + 128;
+            
+            uvRow[x] = (uint8_t)(U < 0 ? 0 : (U > 255 ? 255 : U));
+            uvRow[x + 1] = (uint8_t)(V < 0 ? 0 : (V > 255 ? 255 : V));
+        }
+    }
+}
+
+// OpenGL Context
+class GLContext {
+public:
+    EGLDisplay display;
+    EGLSurface surface;
+    EGLContext context;
+    
+    GLContext() : display(EGL_NO_DISPLAY), surface(EGL_NO_SURFACE), 
+                  context(EGL_NO_CONTEXT) {}
+    
+    bool init() {
+        display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+        if (display == EGL_NO_DISPLAY) return false;
+        
+        EGLint major, minor;
+        if (!eglInitialize(display, &major, &minor)) return false;
+        
+        // Choose config for OpenGL ES 3.0
+        const EGLint configAttribs[] = {
+            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+            EGL_RED_SIZE, 8,
+            EGL_GREEN_SIZE, 8,
+            EGL_BLUE_SIZE, 8,
+            EGL_ALPHA_SIZE, 8,
+            EGL_DEPTH_SIZE, 0,
+            EGL_STENCIL_SIZE, 0,
+            EGL_NONE
+        };
+        
+        EGLConfig config;
+        EGLint numConfigs;
+        if (!eglChooseConfig(display, configAttribs, &config, 1, &numConfigs))
+            return false;
+        
+        // Create PBuffer surface
+        const EGLint pbufferAttribs[] = {
+            EGL_WIDTH, 64,
+            EGL_HEIGHT, 64,
+            EGL_NONE
+        };
+        
+        surface = eglCreatePbufferSurface(display, config, pbufferAttribs);
+        if (surface == EGL_NO_SURFACE) return false;
+        
+        // Create OpenGL ES 3.0 context
+        const EGLint contextAttribs[] = {
+            EGL_CONTEXT_CLIENT_VERSION, 3,
+            EGL_NONE
+        };
+        
+        context = eglCreateContext(display, config, EGL_NO_CONTEXT, contextAttribs);
+        if (context == EGL_NO_CONTEXT) return false;
+        
+        if (!eglMakeCurrent(display, surface, surface, context)) return false;
+        
+        std::cout << "OpenGL ES initialized. Vendor: " << glGetString(GL_VENDOR) 
+                  << ", Renderer: " << glGetString(GL_RENDERER) 
+                  << ", Version: " << glGetString(GL_VERSION) << std::endl;
+        
+        return true;
+    }
+    
+    void cleanup() {
+        if (display != EGL_NO_DISPLAY) {
+            eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            if (context != EGL_NO_CONTEXT) eglDestroyContext(display, context);
+            if (surface != EGL_NO_SURFACE) eglDestroySurface(display, surface);
+            eglTerminate(display);
+        }
+    }
+};
+
+// Simple GPU converter using GLSL for RGB->YUV
+class GPUConverter {
+private:
+    GLuint program;
+    GLuint vao, vbo;
+    GLuint fbo;
+    GLuint yTexture, uvTexture;
+    GLuint pboY, pboUV;  // Pixel Buffer Objects for async readback
+    int width, height;
+    
+    const char* vertexShader = R"(
+        #version 300 es
+        precision highp float;
+        layout(location = 0) in vec2 position;
+        layout(location = 1) in vec2 texCoord;
+        out vec2 vTexCoord;
+        void main() {
+            gl_Position = vec4(position, 0.0, 1.0);
+            vTexCoord = texCoord;
+        }
+    )";
+    
+    const char* fragmentShader = R"(
+        #version 300 es
+        precision highp float;
+        uniform sampler2D inputTexture;
+        uniform bool extractUV;  // false for Y, true for UV
+        in vec2 vTexCoord;
+        out vec4 fragColor;
+        
+        void main() {
+            vec4 color = texture(inputTexture, vTexCoord);
+            
+            if (!extractUV) {
+                // Extract Y (luma) - BT.709
+                float y = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
+                fragColor = vec4(y, 0.0, 0.0, 1.0);
+            } else {
+                // Extract UV (chroma) - average 2x2 block (subsampling)
+                // For simplicity, we'll extract UV at half resolution
+                float u = -0.1146 * color.r - 0.3854 * color.g + 0.5000 * color.b + 0.5;
+                float v = 0.5000 * color.r - 0.4542 * color.g - 0.0458 * color.b + 0.5;
+                fragColor = vec4(u, v, 0.0, 1.0);
+            }
+        }
+    )";
+    
+public:
+    GPUConverter() : program(0), vao(0), vbo(0), fbo(0), 
+                     yTexture(0), uvTexture(0), pboY(0), pboUV(0),
+                     width(0), height(0) {}
+    
+    bool init(int w, int h) {
+        width = w;
+        height = h;
+        
+        // Create shader program
+        GLuint vs = compileShader(GL_VERTEX_SHADER, vertexShader);
+        GLuint fs = compileShader(GL_FRAGMENT_SHADER, fragmentShader);
+        if (!vs || !fs) return false;
+        
+        program = glCreateProgram();
+        glAttachShader(program, vs);
+        glAttachShader(program, fs);
+        glLinkProgram(program);
+        
+        GLint linked;
+        glGetProgramiv(program, GL_LINK_STATUS, &linked);
+        if (!linked) {
+            char log[512];
+            glGetProgramInfoLog(program, 512, nullptr, log);
+            std::cerr << "Shader link error: " << log << std::endl;
+            return false;
+        }
+        
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+        
+        // Create quad for rendering
+        float vertices[] = {
+            // positions   // texCoords
+            -1.0f,  1.0f,  0.0f, 1.0f,
+            -1.0f, -1.0f,  0.0f, 0.0f,
+             1.0f, -1.0f,  1.0f, 0.0f,
+            -1.0f,  1.0f,  0.0f, 1.0f,
+             1.0f, -1.0f,  1.0f, 0.0f,
+             1.0f,  1.0f,  1.0f, 1.0f
+        };
+        
+        glGenVertexArrays(1, &vao);
+        glGenBuffers(1, &vbo);
+        
+        glBindVertexArray(vao);
+        glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+        
+        // Position attribute
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+        
+        // Texture coordinate attribute
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), 
+                            (void*)(2 * sizeof(float)));
+        glEnableVertexAttribArray(1);
+        
+        // Create textures
+        glGenTextures(1, &yTexture);
+        glBindTexture(GL_TEXTURE_2D, yTexture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, 
+                    GL_RED, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        
+        glGenTextures(1, &uvTexture);
+        glBindTexture(GL_TEXTURE_2D, uvTexture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, width/2, height/2, 0,
+                    GL_RG, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        
+        // Create FBO
+        glGenFramebuffers(1, &fbo);
+        
+        // Create PBOS for async readback
+        glGenBuffers(1, &pboY);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, pboY);
+        glBufferData(GL_PIXEL_PACK_BUFFER, width * height, nullptr, GL_STREAM_READ);
+        
+        glGenBuffers(1, &pboUV);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, pboUV);
+        glBufferData(GL_PIXEL_PACK_BUFFER, width * height / 2, nullptr, GL_STREAM_READ);
+        
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        
+        return true;
+    }
+    
+    // Convert using GPU with timing
+    double convert(const uint8_t* rgbaData, uint8_t* nv12Output, 
+                   int srcStrideBytes, Minicap::Format fmt) {
+        auto start = std::chrono::steady_clock::now();
+        
+        // Upload RGBA data to a temporary texture
+        GLuint inputTex;
+        glGenTextures(1, &inputTex);
+        glBindTexture(GL_TEXTURE_2D, inputTex);
+        
+        // Set texture parameters
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        
+        // Upload RGBA data (assuming RGBA format)
+        GLenum format = (fmt == Minicap::FORMAT_BGRA_8888) ? GL_BGRA_EXT : GL_RGBA;
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0,
+                    format, GL_UNSIGNED_BYTE, rgbaData);
+        
+        glUseProgram(program);
+        glBindVertexArray(vao);
+        
+        // Render Y plane (full resolution)
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, 
+                              GL_TEXTURE_2D, yTexture, 0);
+        
+        glViewport(0, 0, width, height);
+        glUniform1i(glGetUniformLocation(program, "extractUV"), 0);
+        
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, inputTex);
+        glUniform1i(glGetUniformLocation(program, "inputTexture"), 0);
+        
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        
+        // Render UV plane (half resolution)
+        glViewport(0, 0, width/2, height/2);
+        glUniform1i(glGetUniformLocation(program, "extractUV"), 1);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                              GL_TEXTURE_2D, uvTexture, 0);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        
+        // Read back Y plane using PBO
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, pboY);
+        glBindTexture(GL_TEXTURE_2D, yTexture);
+        glReadPixels(0, 0, width, height, GL_RED, GL_UNSIGNED_BYTE, 0);
+        
+        // Read back UV plane using PBO
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, pboUV);
+        glBindTexture(GL_TEXTURE_2D, uvTexture);
+        glReadPixels(0, 0, width/2, height/2, GL_RG, GL_UNSIGNED_BYTE, 0);
+        
+        // Map PBOs to copy data
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, pboY);
+        uint8_t* yData = (uint8_t*)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0,
+                                                   width * height,
+                                                   GL_MAP_READ_BIT);
+        if (yData) {
+            memcpy(nv12Output, yData, width * height);
+            glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+        }
+        
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, pboUV);
+        uint8_t* uvData = (uint8_t*)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0,
+                                                    width * height / 2,
+                                                    GL_MAP_READ_BIT);
+        if (uvData) {
+            memcpy(nv12Output + width * height, uvData, width * height / 2);
+            glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+        }
+        
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        glDeleteTextures(1, &inputTex);
+        
+        glFinish(); // Ensure all operations complete
+        
+        auto end = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(end - start).count();
+    }
+    
+    void cleanup() {
+        if (pboY) glDeleteBuffers(1, &pboY);
+        if (pboUV) glDeleteBuffers(1, &pboUV);
+        if (fbo) glDeleteFramebuffers(1, &fbo);
+        if (yTexture) glDeleteTextures(1, &yTexture);
+        if (uvTexture) glDeleteTextures(1, &uvTexture);
+        if (vbo) glDeleteBuffers(1, &vbo);
+        if (vao) glDeleteVertexArrays(1, &vao);
+        if (program) glDeleteProgram(program);
+    }
+    
+private:
+    GLuint compileShader(GLenum type, const char* source) {
+        GLuint shader = glCreateShader(type);
+        glShaderSource(shader, 1, &source, nullptr);
+        glCompileShader(shader);
+        
+        GLint compiled;
+        glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+        if (!compiled) {
+            char log[512];
+            glGetShaderInfoLog(shader, 512, nullptr, log);
+            std::cerr << "Shader compile error: " << log << std::endl;
+            glDeleteShader(shader);
+            return 0;
+        }
+        return shader;
+    }
+};
+
+int main(int argc, char** argv) {
+    // Signal handler
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    
+    // Initialize OpenGL ES context
+    GLContext glContext;
+    if (!glContext.init()) {
+        std::cerr << "Failed to initialize OpenGL ES context" << std::endl;
+        return 1;
+    }
+    
+    std::cout << "=== Testing RGB->NV12 Conversion Latency ===" << std::endl;
+    
+    const int displayId = 0;
+    
+    // Start binder thread pool
+    minicap_start_thread_pool();
+    
+    // Create minicap instance
+    Minicap* minicap = minicap_create(displayId);
+    if (!minicap) {
+        std::cerr << "Failed to create Minicap instance" << std::endl;
+        glContext.cleanup();
+        return 1;
+    }
+    
+    // Get display info
+    Minicap::DisplayInfo realInfo;
+    if (minicap_try_get_display_info(displayId, &realInfo) != 0) {
+        std::cerr << "minicap_try_get_display_info failed" << std::endl;
+        minicap_free(minicap);
+        glContext.cleanup();
+        return 1;
+    }
+    
+    // Calculate desired size
+    Minicap::DisplayInfo desiredInfo = realInfo;
+    int w = realInfo.width;
+    int h = realInfo.height;
+    int longSide = (w > h) ? w : h;
+    
+    if (longSide > MAX_SIZE) {
+        float scale = (float)MAX_SIZE / (float)longSide;
+        int newW = (int)(w * scale);
+        int newH = (int)(h * scale);
+        newW = (newW / 2) * 2;
+        newH = (newH / 2) * 2;
+        if (newW < 2) newW = 2;
+        if (newH < 2) newH = 2;
+        desiredInfo.width = newW;
+        desiredInfo.height = newH;
+    }
+    
+    std::cout << "Real size: " << w << "x" << h << std::endl;
+    std::cout << "Target size: " << desiredInfo.width << "x" << desiredInfo.height << std::endl;
+    
+    // Setup minicap
+    if (minicap->setRealInfo(realInfo) != 0 ||
+        minicap->setDesiredInfo(desiredInfo) != 0 ||
+        minicap->applyConfigChanges() != 0) {
+        std::cerr << "Minicap setup failed" << std::endl;
+        minicap_free(minicap);
+        glContext.cleanup();
+        return 1;
+    }
+    
+    minicap->setFrameAvailableListener(&gWaiter);
+    
+    // Initialize converters
+    GPUConverter gpuConverter;
+    if (!gpuConverter.init(desiredInfo.width, desiredInfo.height)) {
+        std::cerr << "Failed to initialize GPU converter" << std::endl;
+        minicap_free(minicap);
+        glContext.cleanup();
+        return 1;
+    }
+    
+    // Allocate buffers
+    size_t nv12Size = (size_t)desiredInfo.width * (size_t)desiredInfo.height * 3 / 2;
+    std::vector<uint8_t> cpuNV12(nv12Size);
+    std::vector<uint8_t> gpuNV12(nv12Size);
+    
+    // Capture and test
+    std::vector<double> cpuTimes, gpuTimes;
+    Minicap::Frame frame;
+    int frameCount = 0;
+    const int TEST_FRAMES = 30;
+    
+    std::cout << "\nTesting " << TEST_FRAMES << " frames..." << std::endl;
+    
+    while (frameCount < TEST_FRAMES) {
+        if (!gWaiter.waitForFrame(100)) {
+            std::cerr << "Timeout waiting for frame" << std::endl;
+            break;
+        }
+        
+        if (minicap->consumePendingFrame(&frame) != 0) {
+            std::cerr << "Failed to consume frame" << std::endl;
+            continue;
+        }
+        
+        // Test CPU conversion
+        auto cpuStart = std::chrono::steady_clock::now();
+        rgbToNV12_cpu((const uint8_t*)frame.data, cpuNV12.data(),
+                      desiredInfo.width, desiredInfo.height,
+                      frame.stride * frame.bpp, frame.bpp, frame.format);
+        auto cpuEnd = std::chrono::steady_clock::now();
+        cpuTimes.push_back(std::chrono::duration<double, std::milli>(cpuEnd - cpuStart).count());
+        
+        // Test GPU conversion
+        double gpuTime = gpuConverter.convert((const uint8_t*)frame.data, gpuNV12.data(),
+                                              frame.stride * frame.bpp, frame.format);
+        gpuTimes.push_back(gpuTime);
+        
+        // Release frame
+        minicap->releaseConsumedFrame(&frame);
+        
+        frameCount++;
+        
+        if (frameCount % 5 == 0) {
+            std::cout << "Processed " << frameCount << "/" << TEST_FRAMES << " frames" << std::endl;
+        }
+    }
+    
+    // Calculate statistics
+    if (!cpuTimes.empty() && !gpuTimes.empty()) {
+        double cpuAvg = 0, gpuAvg = 0;
+        double cpuMin = cpuTimes[0], gpuMin = gpuTimes[0];
+        double cpuMax = cpuTimes[0], gpuMax = gpuTimes[0];
+        
+        for (size_t i = 0; i < cpuTimes.size(); i++) {
+            cpuAvg += cpuTimes[i];
+            gpuAvg += gpuTimes[i];
+            
+            if (cpuTimes[i] < cpuMin) cpuMin = cpuTimes[i];
+            if (cpuTimes[i] > cpuMax) cpuMax = cpuTimes[i];
+            if (gpuTimes[i] < gpuMin) gpuMin = gpuTimes[i];
+            if (gpuTimes[i] > gpuMax) gpuMax = gpuTimes[i];
+        }
+        
+        cpuAvg /= cpuTimes.size();
+        gpuAvg /= gpuTimes.size();
+        
+        std::cout << "\n=== Results ===" << std::endl;
+        std::cout << "CPU Conversion:" << std::endl;
+        std::cout << "  Average: " << cpuAvg << " ms" << std::endl;
+        std::cout << "  Min: " << cpuMin << " ms, Max: " << cpuMax << " ms" << std::endl;
+        
+        std::cout << "\nGPU Conversion:" << std::endl;
+        std::cout << "  Average: " << gpuAvg << " ms" << std::endl;
+        std::cout << "  Min: " << gpuMin << " ms, Max: " << gpuMax << " ms" << std::endl;
+        
+        std::cout << "\nGPU Speedup: " << (cpuAvg / gpuAvg) << "x faster" << std::endl;
+        std::cout << "Theoretical FPS (GPU only): " << (1000.0 / gpuAvg) << " FPS" << std::endl;
+    }
+    
+    // Cleanup
+    gpuConverter.cleanup();
+    minicap_free(minicap);
+    glContext.cleanup();
+    gWaiter.stop();
+    
+    return 0;
+}
